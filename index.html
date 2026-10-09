@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <!-- Indispensable pour un affichage correct sur téléphone -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Trace Course</title>
+
+  <!-- Feuille de style de Leaflet (bibliothèque de carte) -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <!-- Notre propre style -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="entete">
+    <h1>Trace Course</h1>
+    <p class="aide">
+      <span class="aide-souris">Clique</span><span class="aide-tactile">Touche</span>
+      la carte pour ajouter des points. Fais glisser un point pour le déplacer.
+    </p>
+  </header>
+
+  <main class="contenu">
+    <!-- La carte Leaflet sera dessinée dans cette div -->
+    <div id="carte"></div>
+
+    <!-- Panneau des statistiques du parcours -->
+    <section class="stats" aria-label="Statistiques du parcours">
+      <div class="stat">
+        <span class="stat-label">Distance</span>
+        <span class="stat-valeur" id="stat-distance">0.00 km</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">D+</span>
+        <span class="stat-valeur" id="stat-dplus">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">D-</span>
+        <span class="stat-valeur" id="stat-dmoins">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Alt. min</span>
+        <span class="stat-valeur" id="stat-altmin">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Alt. max</span>
+        <span class="stat-valeur" id="stat-altmax">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Temps estimé</span>
+        <span class="stat-valeur" id="stat-temps">—</span>
+        <span class="stat-detail" id="stat-temps-detail"></span>
+      </div>
+    </section>
+
+    <!-- Zone de messages (chargement, erreurs) -->
+    <div id="message" class="message" hidden>
+      <span id="message-texte"></span>
+      <button id="btn-reessayer" class="btn btn-petit" hidden>Réessayer</button>
+    </div>
+
+    <!-- Boutons d'action -->
+    <section class="actions" aria-label="Actions">
+      <button id="btn-annuler" class="btn">↶ Annuler le dernier point</button>
+      <button id="btn-boucle" class="btn">⟲ Fermer la boucle</button>
+      <button id="btn-effacer" class="btn btn-danger">✕ Effacer tout</button>
+      <button id="btn-gpx" class="btn">⤓ Exporter GPX</button>
+      <button id="btn-import" class="btn">⤒ Importer GPX</button>
+      <!-- Sélecteur de fichier caché : le bouton ci-dessus l'ouvre -->
+      <input type="file" id="fichier-gpx" accept=".gpx,application/gpx+xml" hidden>
+
+      <!-- Allure sur le plat, pour estimer le temps de course -->
+      <div class="allure" role="group" aria-label="Allure sur le plat">
+        <span>Allure</span>
+        <input type="number" id="allure-min" min="2" max="20" step="1" value="5"
+               inputmode="numeric" aria-label="Minutes par kilomètre">
+        <span>:</span>
+        <input type="number" id="allure-sec" min="0" max="59" step="1" value="30"
+               inputmode="numeric" aria-label="Secondes par kilomètre">
+        <span>min/km</span>
+      </div>
+
+      <label class="interrupteur">
+        <input type="checkbox" id="chk-routage" checked>
+        Suivre les chemins
+      </label>
+    </section>
+
+    <!-- Profil altimétrique (graphique Chart.js) -->
+    <section class="profil" aria-label="Profil altimétrique">
+      <h2>Profil altimétrique</h2>
+      <div class="profil-cadre">
+        <canvas id="profil-canvas"></canvas>
+        <p id="profil-vide" class="profil-vide">Ajoute au moins deux points pour voir le profil.</p>
+      </div>
+    </section>
+  </main>
+
+  <!-- Bibliothèques externes : Leaflet (carte) puis Chart.js (graphique) -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <!-- Notre code, chargé en dernier -->
+  <script src="app.js"></script>
+</body>
+</html>
