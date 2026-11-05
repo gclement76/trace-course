@@ -352,6 +352,10 @@ const FENETRE_LISSAGE = 5;       // moyenne glissante sur 5 points (~150 m)
 const SEUIL_DENIVELE = 3;        // une variation n'est comptée qu'au-delà de 3 m
 const DELAI_ANTI_RAFALE = 400;   // on attend 0,4 s de calme avant de lancer le calcul
 const DELAI_MAX_ALTITUDE = 10000;
+// Le service limite le nombre de points par minute (environ 600, soit 6 paquets).
+// Au-delà, il répond « 429 » : on attend une minute puis on réessaie le même paquet.
+const ATTENTE_LIMITE = 60;       // secondes d'attente après une réponse 429
+const MAX_ESSAIS_LIMITE = 5;     // au-delà, on abandonne (bouton « Réessayer »)
 
 // Attribution demandée par Open-Meteo (programme Copernicus)
 carte.attributionControl.addAttribution(
@@ -365,6 +369,42 @@ const cacheAltitudes = new Map();
 function cleAltitude(latlng) {
   return `${latlng.lat.toFixed(4)},${latlng.lng.toFixed(4)}`;
 }
+
+/* Sauvegarde des altitudes dans le navigateur (localStorage).
+   L'altitude d'un endroit ne change jamais : une valeur enregistrée reste juste.
+   On ne garde que les points du parcours actuel, pour que la sauvegarde ne grossisse
+   pas sans fin (environ 20 Ko pour 20 km). Au rechargement, le profil s'affiche
+   donc sans redemander les altitudes au service. */
+const CLE_ALTITUDES = "trace-course-altitudes";
+
+// Enregistre les altitudes connues des échantillons du parcours actuel
+function sauvegarderAltitudes(echantillons) {
+  const altitudes = {};
+  for (const e of echantillons) {
+    const cle = cleAltitude(e.latlng);
+    if (cacheAltitudes.has(cle)) altitudes[cle] = cacheAltitudes.get(cle);
+  }
+  try {
+    localStorage.setItem(CLE_ALTITUDES, JSON.stringify({ version: 1, altitudes }));
+  } catch (erreur) {
+    // Stockage plein ou bloqué : les altitudes seront simplement redemandées
+    console.warn("Sauvegarde des altitudes impossible :", erreur.message);
+  }
+}
+
+// Remplit la mémoire avec les altitudes enregistrées lors d'une visite précédente
+function restaurerAltitudes() {
+  try {
+    const donnees = JSON.parse(localStorage.getItem(CLE_ALTITUDES));
+    if (!donnees || typeof donnees.altitudes !== "object") return;
+    for (const [cle, altitude] of Object.entries(donnees.altitudes)) {
+      if (Number.isFinite(altitude)) cacheAltitudes.set(cle, altitude);
+    }
+  } catch (erreur) {
+    // Stockage indisponible ou contenu illisible : on repart de zéro
+  }
+}
+restaurerAltitudes();
 
 // Place un point tous les « pas » mètres le long d'une géométrie.
 // Renvoie [{ latlng, d }] où d = distance depuis le début de la géométrie.
@@ -420,7 +460,11 @@ async function demanderAltitudes(latlngs) {
   const url = `${URL_ALTITUDE}?latitude=${latitudes}&longitude=${longitudes}`;
 
   const reponse = await fetch(url, { signal: AbortSignal.timeout(DELAI_MAX_ALTITUDE) });
-  if (!reponse.ok) throw new Error(`Erreur HTTP ${reponse.status}`);
+  if (!reponse.ok) {
+    const erreur = new Error(`Erreur HTTP ${reponse.status}`);
+    erreur.statut = reponse.status; // 429 = limite du service atteinte (voir plus bas)
+    throw erreur;
+  }
 
   const donnees = await reponse.json();
   const altitudes = donnees.elevation;
@@ -473,8 +517,57 @@ function planifierAltitude() {
   minuterieAltitude = setTimeout(calculerProfil, DELAI_ANTI_RAFALE);
 }
 
+// Nombre d'échantillons dont l'altitude est connue, en partant du départ
+// et sans trou (c'est la partie du profil qu'on peut déjà dessiner)
+function nbAltitudesConnues(echantillons) {
+  let n = 0;
+  while (n < echantillons.length && cacheAltitudes.has(cleAltitude(echantillons[n].latlng))) n++;
+  return n;
+}
+
+// Construit le profil (lissé, avec D+, D-, min, max) des « n » premiers échantillons.
+// Renvoie null s'il y a moins de 2 points ou une altitude invalide.
+function construireProfil(echantillons, n) {
+  const debut = echantillons.slice(0, n);
+  const brutes = debut.map((e) => cacheAltitudes.get(cleAltitude(e.latlng)));
+  if (debut.length < 2 || brutes.some((a) => !Number.isFinite(a))) return null;
+
+  const altitudes = lisser(brutes, FENETRE_LISSAGE);
+  const { dPlus, dMoins } = calculerDenivele(altitudes, SEUIL_DENIVELE);
+  return {
+    distances: debut.map((e) => e.d),
+    latlngs: debut.map((e) => e.latlng),
+    altitudes,
+    dPlus,
+    dMoins,
+    min: Math.min(...altitudes),
+    max: Math.max(...altitudes),
+  };
+}
+
+// Demande un paquet d'altitudes. Si le service répond « limite atteinte » (429),
+// on attend ATTENTE_LIMITE secondes (compte à rebours via « annoncerAttente »)
+// puis on réessaie. Renvoie null si le calcul est devenu inutile entre-temps.
+async function demanderAltitudesPatiemment(paquet, estAJour, annoncerAttente) {
+  for (let essai = 1; ; essai++) {
+    try {
+      return await demanderAltitudes(paquet);
+    } catch (erreur) {
+      // Autre erreur, ou trop d'essais : on laisse l'erreur remonter
+      if (erreur.statut !== 429 || essai >= MAX_ESSAIS_LIMITE) throw erreur;
+    }
+    for (let reste = ATTENTE_LIMITE; reste > 0; reste--) {
+      if (!estAJour()) return null;
+      annoncerAttente(reste);
+      await pause(1000);
+    }
+    if (!estAJour()) return null;
+  }
+}
+
 async function calculerProfil() {
   const version = ++versionProfil;
+  const estAJour = () => version === versionProfil; // un calcul plus récent a-t-il pris le relais ?
 
   if (etat.segments.length === 0) {
     etat.altitude = { statut: "vide", profil: null };
@@ -486,8 +579,9 @@ async function calculerProfil() {
   if (etat.marqueurEnGlissement || etat.requetesEnCours > 0) return;
 
   const echantillons = echantillonnerParcours();
+  const distanceTotale = echantillons[echantillons.length - 1].d;
 
-  // Points dont l'altitude n'est pas encore connue (sans doublons)
+  // Points dont l'altitude n'est pas encore connue (sans doublons, dans l'ordre du parcours)
   const aDemander = new Map();
   for (const e of echantillons) {
     const cle = cleAltitude(e.latlng);
@@ -495,49 +589,47 @@ async function calculerProfil() {
   }
   const manquants = [...aDemander.values()];
 
-  if (manquants.length > 0) {
-    etat.altitude.statut = "chargement";
+  // Affiche la partie du profil déjà connue ; « chargement » décrit la partie restante
+  // (texte affiché dessus, et « erreur » à true si on a abandonné)
+  const montrerAvancement = (statut, texte, erreur = false) => {
+    etat.altitude = {
+      statut,
+      profil: construireProfil(echantillons, nbAltitudesConnues(echantillons)),
+      chargement: { distanceTotale, texte, erreur },
+    };
     afficherAltitude();
+  };
+
+  if (manquants.length > 0) {
+    const nbPaquets = Math.ceil(manquants.length / TAILLE_PAQUET);
     try {
-      // Requêtes par paquets de 100, l'une après l'autre
+      // Requêtes par paquets de 100, l'une après l'autre : la courbe s'allonge à chaque réponse
       for (let i = 0; i < manquants.length; i += TAILLE_PAQUET) {
+        const numero = i / TAILLE_PAQUET + 1;
+        montrerAvancement("chargement", `Chargement de l'altitude… (${numero}/${nbPaquets})`);
         const paquet = manquants.slice(i, i + TAILLE_PAQUET);
-        const altitudes = await demanderAltitudes(paquet);
+        const altitudes = await demanderAltitudesPatiemment(paquet, estAJour, (reste) =>
+          montrerAvancement("chargement", `Limite du service atteinte : reprise dans ${reste} s`)
+        );
+        if (altitudes === null) return;
+        // On garde les valeurs reçues même si le tracé a changé entre-temps (elles restent justes)
         paquet.forEach((p, j) => cacheAltitudes.set(cleAltitude(p), altitudes[j]));
-        if (version !== versionProfil) return; // un calcul plus récent a pris le relais
+        if (!estAJour()) return;
+        // Sauvegarde après chaque paquet : un chargement interrompu reprendra où il en était
+        sauvegarderAltitudes(echantillons);
       }
     } catch (erreur) {
       console.warn("Altitude indisponible :", erreur.message);
-      if (version !== versionProfil) return;
-      // La distance reste affichée : seules les données d'altitude manquent
-      etat.altitude = { statut: "erreur", profil: null };
-      afficherAltitude();
+      if (!estAJour()) return;
+      // La distance reste affichée, et la partie du profil déjà reçue aussi
+      montrerAvancement("erreur", "Altitude indisponible pour la suite du parcours", true);
       return;
     }
   }
 
-  // Toutes les altitudes sont connues : on construit le profil
-  const brutes = echantillons.map((e) => cacheAltitudes.get(cleAltitude(e.latlng)));
-  if (brutes.some((a) => !Number.isFinite(a))) {
-    etat.altitude = { statut: "erreur", profil: null };
-    afficherAltitude();
-    return;
-  }
-  const altitudes = lisser(brutes, FENETRE_LISSAGE);
-  const { dPlus, dMoins } = calculerDenivele(altitudes, SEUIL_DENIVELE);
-
-  etat.altitude = {
-    statut: "ok",
-    profil: {
-      distances: echantillons.map((e) => e.d),
-      latlngs: echantillons.map((e) => e.latlng),
-      altitudes,
-      dPlus,
-      dMoins,
-      min: Math.min(...altitudes),
-      max: Math.max(...altitudes),
-    },
-  };
+  // Toutes les altitudes sont connues : on construit le profil complet
+  const profil = construireProfil(echantillons, echantillons.length);
+  etat.altitude = profil ? { statut: "ok", profil } : { statut: "erreur", profil: null };
   afficherAltitude();
 }
 
@@ -718,7 +810,7 @@ function majMessage() {
       reessayerRoutage
     );
   } else if (etat.altitude.statut === "chargement") {
-    afficherMessage("Calcul des altitudes…", "info");
+    afficherMessage(etat.altitude.chargement.texte, "info");
   } else if (etat.altitude.statut === "erreur") {
     afficherMessage(
       "Altitude indisponible (service injoignable ou pas de réseau). La distance reste valable.",
@@ -747,9 +839,10 @@ function afficherAltitude() {
     document.getElementById("stat-dmoins").textContent = texte(profil && profil.dMoins);
     document.getElementById("stat-altmin").textContent = texte(profil && profil.min);
     document.getElementById("stat-altmax").textContent = texte(profil && profil.max);
-    dessinerProfil();
     afficherTemps(); // le D+ entre dans l'estimation du temps
   }
+  // Le graphique, lui, se redessine à chaque paquet reçu (chargement progressif)
+  dessinerProfil();
   majMessage();
 }
 
@@ -877,13 +970,63 @@ function creerGraphiqueProfil() {
         },
       },
     },
-    plugins: [pluginCurseurVertical, pluginSuiviCarte],
+    plugins: [pluginCurseurVertical, pluginSuiviCarte, pluginVoileChargement],
   });
 }
 
+// Place la zone hachurée « en cours de chargement » sur la partie du profil
+// qui n'est pas encore connue (à droite de la courbe déjà dessinée)
+function placerVoileChargement(chart) {
+  const voile = document.getElementById("profil-chargement");
+  const { profil, chargement } = etat.altitude;
+  if (!chart || !chargement) {
+    voile.hidden = true;
+    return;
+  }
+  const zone = chart.chartArea; // rectangle du tracé, en pixels, sans les axes
+  const finConnue = profil ? profil.distances[profil.distances.length - 1] / 1000 : 0;
+  const gauche = Math.max(zone.left, chart.scales.x.getPixelForValue(finConnue));
+  const largeur = zone.right - gauche;
+
+  voile.style.left = gauche + "px";
+  voile.style.top = zone.top + "px";
+  voile.style.width = largeur + "px";
+  voile.style.height = zone.bottom - zone.top + "px";
+  document.getElementById("profil-chargement-texte").textContent = chargement.texte;
+  voile.classList.toggle("en-erreur", chargement.erreur); // pas de rond qui tourne en cas d'échec
+  voile.hidden = largeur < 1;
+}
+
+// Plugin Chart.js : repositionne le voile après chaque dessin (y compris au redimensionnement)
+const pluginVoileChargement = {
+  id: "voileChargement",
+  afterDraw(chart) {
+    placerVoileChargement(chart);
+  },
+};
+
 function dessinerProfil() {
-  const profil = etat.altitude.statut === "ok" ? etat.altitude.profil : null;
+  const { statut, chargement } = etat.altitude;
+  const profil = statut === "ok" || chargement ? etat.altitude.profil : null;
   const texteVide = document.getElementById("profil-vide");
+
+  // Pendant un chargement, on montre le graphique même s'il n'y a encore aucun point
+  if (chargement) {
+    texteVide.hidden = true;
+    if (!graphiqueProfil) graphiqueProfil = creerGraphiqueProfil();
+    const graphique = graphiqueProfil;
+    graphique.data.datasets[0].data = profil
+      ? profil.distances.map((d, i) => ({ x: d / 1000, y: profil.altitudes[i] }))
+      : [];
+    // L'axe couvre tout le parcours : la partie manquante reste visible, sous le voile
+    graphique.options.scales.x.min = 0;
+    graphique.options.scales.x.max = chargement.distanceTotale / 1000;
+    graphique.options.scales.y.suggestedMin = profil ? Math.floor(profil.min - 10) : undefined;
+    graphique.options.scales.y.suggestedMax = profil ? Math.ceil(profil.max + 10) : undefined;
+    graphique.update(); // le plugin replace le voile
+    return;
+  }
+  placerVoileChargement(null); // plus de chargement : on retire le voile
 
   if (!profil) {
     // Pas de profil : on vide le graphique et on explique pourquoi
